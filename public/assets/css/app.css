@@ -1,0 +1,143 @@
+:root {
+    --ump-green: #0f6f4a;
+    --ump-green-dark: #0b5537;
+    --ump-green-light: #e6f4ee;
+    --ump-gold: #f0a500;
+}
+
+body {
+    background: #f4f6f8;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.app-topbar {
+    background: linear-gradient(90deg, var(--ump-green-dark), var(--ump-green));
+}
+
+.app-public .app-main {
+    flex: 1 0 auto;
+}
+
+.app-shell .app-main {
+    min-height: calc(100vh - 56px);
+}
+
+/* Sidebar */
+.app-sidebar {
+    background: #ffffff;
+    border-right: 1px solid #e5e7eb;
+    min-height: calc(100vh - 56px);
+}
+
+.app-sidebar .list-group-item {
+    border: 0;
+    border-left: 3px solid transparent;
+    padding: .8rem 1.1rem;
+    color: #374151;
+    font-weight: 500;
+}
+
+.app-sidebar .list-group-item:hover {
+    background: var(--ump-green-light);
+    color: var(--ump-green-dark);
+}
+
+.app-sidebar .list-group-item.active {
+    background: var(--ump-green-light);
+    color: var(--ump-green-dark);
+    border-left-color: var(--ump-green);
+}
+
+/* Cards */
+.stat-card {
+    border: 0;
+    border-radius: .75rem;
+    box-shadow: 0 1px 3px rgba(16, 24, 40, .08);
+}
+
+.stat-card .stat-icon {
+    width: 46px;
+    height: 46px;
+    border-radius: .6rem;
+    display: grid;
+    place-items: center;
+    font-size: 1.3rem;
+}
+
+.bg-soft-green { background: var(--ump-green-light); color: var(--ump-green-dark); }
+.bg-soft-gold { background: #fff4dd; color: #a5700a; }
+.bg-soft-blue { background: #e8f0fe; color: #1a56db; }
+.bg-soft-red { background: #fdeaea; color: #b42318; }
+
+.card {
+    border: 0;
+    border-radius: .75rem;
+    box-shadow: 0 1px 3px rgba(16, 24, 40, .06);
+}
+
+.btn-primary {
+    background-color: var(--ump-green);
+    border-color: var(--ump-green);
+}
+
+.btn-primary:hover, .btn-primary:focus {
+    background-color: var(--ump-green-dark);
+    border-color: var(--ump-green-dark);
+}
+
+.btn-outline-primary {
+    color: var(--ump-green);
+    border-color: var(--ump-green);
+}
+
+.btn-outline-primary:hover {
+    background-color: var(--ump-green);
+    border-color: var(--ump-green);
+}
+
+.text-brand { color: var(--ump-green) !important; }
+
+/* Public hero */
+.hero {
+    background: linear-gradient(135deg, var(--ump-green-dark), var(--ump-green));
+    color: #fff;
+    border-radius: 1rem;
+    padding: 3rem 2rem;
+}
+
+.feature-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: .75rem;
+    display: grid;
+    place-items: center;
+    font-size: 1.4rem;
+}
+
+.passport-photo {
+    width: 110px;
+    height: 110px;
+    object-fit: cover;
+    border-radius: .75rem;
+    border: 3px solid #fff;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .15);
+}
+
+.table > :not(caption) > * > * {
+    padding: .65rem .75rem;
+}
+
+.receipt {
+    max-width: 720px;
+    margin: 0 auto;
+}
+
+@media print {
+    .app-topbar, .app-sidebar, .no-print, .app-footer {
+        display: none !important;
+    }
+    body { background: #fff; }
+    .app-main { width: 100% !important; }
+}

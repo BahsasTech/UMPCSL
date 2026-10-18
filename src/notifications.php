@@ -1,0 +1,644 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Notifications: SMS and email delivery, templating, logging and broadcasts.
+ *
+ * Delivery is pluggable per channel:
+ *   email : log | mail | smtp
+ *   sms   : log | generic_http | termii | twilio
+ *
+ * The "log" driver records the message without contacting any provider,
+ * which is the safe default for development. Provider settings can be edited
+ * from Admin -> Notifications -> Settings (persisted in the `settings` table).
+ */
+
+/**
+ * Effective notification configuration: config defaults overlaid with any
+ * provider values saved in the settings table.
+ */
+function notification_config(): array
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+
+    $cfg = config('notifications', []);
+    $rows = fetch_all("SELECT `key`, `value` FROM settings WHERE `key` LIKE 'notify_%'");
+    $saved = [];
+    foreach ($rows as $row) {
+        $saved[substr($row['key'], 7)] = $row['value'];
+    }
+
+    $pick = function (string $key, $default) use ($saved) {
+        return array_key_exists($key, $saved) && $saved[$key] !== '' ? $saved[$key] : $default;
+    };
+    $bool = function (string $key, $default) use ($pick) {
+        return in_array((string) $pick($key, $default ? '1' : '0'), ['1', 'true', 'yes', 'on'], true);
+    };
+
+    $cfg = [
+        'email' => [
+            'enabled'      => $bool('email_enabled', $cfg['email']['enabled'] ?? false),
+            'driver'       => (string) $pick('email_driver', $cfg['email']['driver'] ?? 'log'),
+            'from_address' => (string) $pick('email_from_address', $cfg['email']['from_address'] ?? 'no-reply@umpcsl.com'),
+            'from_name'    => (string) $pick('email_from_name', $cfg['email']['from_name'] ?? 'UMPCSL'),
+            'smtp'         => [
+                'host'       => (string) $pick('smtp_host', $cfg['email']['smtp']['host'] ?? ''),
+                'port'       => (int) $pick('smtp_port', $cfg['email']['smtp']['port'] ?? 587),
+                'username'   => (string) $pick('smtp_username', $cfg['email']['smtp']['username'] ?? ''),
+                'password'   => (string) $pick('smtp_password', $cfg['email']['smtp']['password'] ?? ''),
+                'encryption' => (string) $pick('smtp_encryption', $cfg['email']['smtp']['encryption'] ?? 'tls'),
+            ],
+        ],
+        'sms' => [
+            'enabled'     => $bool('sms_enabled', $cfg['sms']['enabled'] ?? false),
+            'driver'      => (string) $pick('sms_driver', $cfg['sms']['driver'] ?? 'log'),
+            'sender_id'   => (string) $pick('sms_sender_id', $cfg['sms']['sender_id'] ?? 'UMPCSL'),
+            'api_key'     => (string) $pick('sms_api_key', $cfg['sms']['api_key'] ?? ''),
+            'generic_url' => (string) $pick('sms_generic_url', $cfg['sms']['generic_url'] ?? ''),
+            'url_method'  => strtoupper((string) $pick('sms_url_method', $cfg['sms']['url_method'] ?? 'GET')),
+            'termii_url'  => (string) $pick('sms_termii_url', $cfg['sms']['termii_url'] ?? 'https://api.ng.termii.com/api/sms/send'),
+            'twilio'      => [
+                'sid'   => (string) $pick('sms_twilio_sid', $cfg['sms']['twilio']['sid'] ?? ''),
+                'token' => (string) $pick('sms_twilio_token', $cfg['sms']['twilio']['token'] ?? ''),
+                'from'  => (string) $pick('sms_twilio_from', $cfg['sms']['twilio']['from'] ?? ''),
+            ],
+        ],
+    ];
+
+    return $cache = $cfg;
+}
+
+/** Notification templates keyed by event name. */
+function notification_templates(): array
+{
+    return [
+        'welcome' => [
+            'email_subject' => 'Welcome to {org}',
+            'email_body'    => "Dear {first_name},\n\nWelcome to {org}. Your membership number is {membership_no}.\n\nYou can now sign in to track your savings and loans.\n\nRegards,\n{org}",
+            'sms'           => 'Welcome {first_name}! Your {org} membership no. is {membership_no}.',
+        ],
+        'loan_applied' => [
+            'email_subject' => 'Loan application {loan_no} received',
+            'email_body'    => "Dear {first_name},\n\nWe have received your loan application {loan_no} for {amount}. It is now awaiting review.\n\nRegards,\n{org}",
+            'sms'           => 'Your loan application {loan_no} of {amount} has been received and is under review.',
+        ],
+        'loan_approved' => [
+            'email_subject' => 'Loan {loan_no} approved',
+            'email_body'    => "Dear {first_name},\n\nYour loan {loan_no} has been approved.\nAmount: {amount}\nTotal repayable: {total_repayable}\nTerm: {term_months} months.\n\nRegards,\n{org}",
+            'sms'           => 'Good news {first_name}! Your loan {loan_no} of {amount} has been approved. Total repayable {total_repayable}.',
+        ],
+        'loan_rejected' => [
+            'email_subject' => 'Loan {loan_no} decision',
+            'email_body'    => "Dear {first_name},\n\nWe regret to inform you that your loan application {loan_no} was not approved.\nReason: {remarks}\n\nRegards,\n{org}",
+            'sms'           => 'Your loan {loan_no} was not approved. Reason: {remarks}',
+        ],
+        'loan_disbursed' => [
+            'email_subject' => 'Loan {loan_no} disbursed',
+            'email_body'    => "Dear {first_name},\n\nYour loan {loan_no} of {amount} has been disbursed. Your repayment schedule is now available in your portal.\n\nRegards,\n{org}",
+            'sms'           => 'Your loan {loan_no} of {amount} has been disbursed. Check your portal for the repayment schedule.',
+        ],
+        'repayment_received' => [
+            'email_subject' => 'Repayment received for {loan_no}',
+            'email_body'    => "Dear {first_name},\n\nWe have received your repayment of {amount} for loan {loan_no}.\nOutstanding balance: {outstanding}.\nReceipt: {receipt_no}\n\nRegards,\n{org}",
+            'sms'           => 'Payment of {amount} received for {loan_no}. Outstanding: {outstanding}. Receipt {receipt_no}.',
+        ],
+        'savings_contribution' => [
+            'email_subject' => 'Savings contribution received',
+            'email_body'    => "Dear {first_name},\n\nWe have received your savings contribution of {amount}.\nReceipt: {receipt_no}\n\nRegards,\n{org}",
+            'sms'           => 'Contribution of {amount} received. Receipt {receipt_no}. Thank you {first_name}.',
+        ],
+        'repayment_reminder' => [
+            'email_subject' => 'Upcoming repayment for {loan_no}',
+            'email_body'    => "Dear {first_name},\n\nThis is a reminder that installment {installment} of {amount_due} for loan {loan_no} is due on {due_date}.\n\nRegards,\n{org}",
+            'sms'           => 'Reminder: installment {installment} of {amount_due} for {loan_no} is due {due_date}.',
+        ],
+        'missed_payment' => [
+            'email_subject' => 'Missed repayment for {loan_no}',
+            'email_body'    => "Dear {first_name},\n\nOur records show that installment {installment} of {amount_due} for loan {loan_no} was due on {due_date} and has not been received. Please settle it as soon as possible.\n\nRegards,\n{org}",
+            'sms'           => 'Missed payment: installment {installment} of {amount_due} for {loan_no} was due {due_date}.',
+        ],
+        'announcement' => [
+            'email_subject' => '{subject}',
+            'email_body'    => "{body}",
+            'sms'           => '{body}',
+        ],
+        'order_placed' => [
+            'email_subject' => 'Order {order_no} placed',
+            'email_body'    => "Dear {first_name},\n\nThank you for your order!\nOrder no: {order_no}\nTotal: {amount}\n\nWe will notify you when your order is ready for collection or dispatch.\n\nRegards,\n{org}",
+            'sms'           => 'Order {order_no} received. Total {amount}. We will notify you when it is ready.',
+        ],
+        'order_ready' => [
+            'email_subject' => 'Order {order_no} is ready',
+            'email_body'    => "Dear {first_name},\n\nYour order {order_no} is ready.\nTotal: {amount}\n\nRegards,\n{org}",
+            'sms'           => 'Order {order_no} is ready. Please pick up or arrange collection.',
+        ],
+        'sale_receipt' => [
+            'email_subject' => 'Receipt for {receipt_no}',
+            'email_body'    => "Dear {first_name},\n\nThank you for your purchase!\nReceipt: {receipt_no}\nAmount paid: {amount}\n\nRegards,\n{org}",
+            'sms'           => 'Receipt {receipt_no}: {amount} paid. Thank you!',
+        ],
+        'payment_received' => [
+            'email_subject' => 'Payment received — {amount}',
+            'email_body'    => "Dear {first_name},\n\nWe have received your online payment of {amount} for {purpose}.\nReference: {reference}\n\nThank you.\n\nRegards,\n{org}",
+            'sms'           => 'Payment of {amount} received for {purpose}. Ref {reference}. Thank you {first_name}.',
+        ],
+    ];
+}
+
+/** Replace {placeholder} tokens with values. */
+function render_template(string $text, array $vars): string
+{
+    $vars['org'] = $vars['org'] ?? (string) config('app.name');
+    $replace = [];
+    foreach ($vars as $key => $value) {
+        $replace['{' . $key . '}'] = is_scalar($value) ? (string) $value : '';
+    }
+    return strtr($text, $replace);
+}
+
+/**
+ * Low level delivery. Returns ['status' => sent|logged|failed, 'provider', 'error'].
+ */
+function deliver(string $channel, string $recipient, string $subject, string $body): array
+{
+    $cfg = notification_config();
+    try {
+        if ($channel === 'email') {
+            $driver = $cfg['email']['driver'];
+            if (!$cfg['email']['enabled'] || $driver === 'log') {
+                return ['status' => 'logged', 'provider' => 'log', 'error' => null];
+            }
+            if ($driver === 'smtp') {
+                smtp_send($cfg['email'], $recipient, $subject, $body);
+                return ['status' => 'sent', 'provider' => 'smtp', 'error' => null];
+            }
+            mail_send($cfg['email'], $recipient, $subject, $body);
+            return ['status' => 'sent', 'provider' => 'mail', 'error' => null];
+        }
+
+        // SMS
+        $driver = $cfg['sms']['driver'];
+        if (!$cfg['sms']['enabled'] || $driver === 'log') {
+            return ['status' => 'logged', 'provider' => 'log', 'error' => null];
+        }
+        switch ($driver) {
+            case 'termii':
+                sms_termii($cfg['sms'], $recipient, $body);
+                return ['status' => 'sent', 'provider' => 'termii', 'error' => null];
+            case 'twilio':
+                sms_twilio($cfg['sms'], $recipient, $body);
+                return ['status' => 'sent', 'provider' => 'twilio', 'error' => null];
+            default:
+                sms_generic($cfg['sms'], $recipient, $body);
+                return ['status' => 'sent', 'provider' => 'generic_http', 'error' => null];
+        }
+    } catch (Throwable $e) {
+        return ['status' => 'failed', 'provider' => $cfg[$channel]['driver'] ?? 'unknown', 'error' => $e->getMessage()];
+    }
+}
+
+/** Deliver and log a single notification. Returns the notification id. */
+function send_notification(string $channel, string $recipient, string $subject, string $body, array $meta = []): int
+{
+    $result = deliver($channel, $recipient, $subject, $body);
+    return (int) db_insert('notifications', [
+        'member_id'  => $meta['member_id'] ?? null,
+        'channel'    => $channel,
+        'event'      => $meta['event'] ?? 'custom',
+        'recipient'  => $recipient,
+        'subject'    => $subject !== '' ? substr($subject, 0, 190) : null,
+        'body'       => $body,
+        'status'     => $result['status'],
+        'provider'   => $result['provider'],
+        'error'      => $result['error'] !== null ? substr((string) $result['error'], 0, 255) : null,
+        'sent_at'    => in_array($result['status'], ['sent', 'logged'], true) ? date('Y-m-d H:i:s') : null,
+        'created_by' => $meta['created_by'] ?? ($_SESSION['user_id'] ?? null),
+    ]);
+}
+
+/**
+ * Notify a member about an event using their contact details.
+ * Returns the list of notification ids created.
+ */
+function notify_member(int $memberId, string $event, array $vars = [], ?array $channels = null): array
+{
+    $templates = notification_templates();
+    if (!isset($templates[$event])) {
+        return [];
+    }
+    $member = get_member($memberId);
+    if (!$member) {
+        return [];
+    }
+
+    $vars = array_merge([
+        'first_name' => $member['first_name'],
+        'last_name'  => $member['last_name'],
+        'membership_no' => $member['membership_no'],
+        'org'        => (string) config('app.name'),
+    ], $vars);
+
+    $template = $templates[$event];
+    $channels = $channels ?? ['email', 'sms'];
+    $ids = [];
+
+    if (in_array('email', $channels, true) && !empty($member['email'])) {
+        $ids[] = send_notification(
+            'email',
+            (string) $member['email'],
+            render_template($template['email_subject'], $vars),
+            render_template($template['email_body'], $vars),
+            ['member_id' => $memberId, 'event' => $event]
+        );
+    }
+    $phone = $member['phone'] ?? ($member['user_phone'] ?? null);
+    if (in_array('sms', $channels, true) && !empty($phone)) {
+        $ids[] = send_notification(
+            'sms',
+            (string) $phone,
+            '',
+            render_template($template['sms'], $vars),
+            ['member_id' => $memberId, 'event' => $event]
+        );
+    }
+
+    return $ids;
+}
+
+/**
+ * Fire-and-forget wrapper so notification problems never break a request.
+ */
+function safe_notify_member(int $memberId, string $event, array $vars = [], ?array $channels = null): void
+{
+    try {
+        notify_member($memberId, $event, $vars, $channels);
+    } catch (Throwable $e) {
+        // Never let a notification failure affect the primary action.
+    }
+}
+
+/** Send an ad-hoc email to an address. */
+function notify_email(string $to, string $subject, string $body, array $meta = []): int{
+    return send_notification('email', $to, $subject, $body, $meta);
+}
+
+/** Send an ad-hoc SMS to a phone number. */
+function notify_sms(string $to, string $body, array $meta = []): int
+{
+    return send_notification('sms', $to, '', $body, $meta);
+}
+
+/**
+ * Broadcast an announcement to an audience.
+ * audience: all | active_members | with_loans | staff
+ */
+function send_announcement(string $subject, string $body, string $audience, array $channels): array
+{
+    $recipients = [];
+    switch ($audience) {
+        case 'staff':
+            foreach (fetch_all('SELECT full_name, email, phone FROM users WHERE role IN ("admin","staff") AND status = "active"') as $u) {
+                $recipients[] = ['email' => $u['email'], 'phone' => $u['phone'], 'vars' => ['first_name' => $u['full_name'], 'subject' => $subject, 'body' => $body]];
+            }
+            break;
+        case 'with_loans':
+            foreach (fetch_all('SELECT DISTINCT m.*, u.email, u.phone AS phone FROM members m JOIN users u ON u.id = m.user_id JOIN loans l ON l.member_id = m.id WHERE m.status = "active"') as $m) {
+                $recipients[] = ['email' => $m['email'], 'phone' => $m['phone'] ?? null, 'member_id' => (int) $m['id'],
+                    'vars' => ['first_name' => $m['first_name'], 'membership_no' => $m['membership_no'], 'subject' => $subject, 'body' => $body]];
+            }
+            break;
+        case 'active_members':
+            foreach (fetch_all('SELECT m.*, u.email, u.phone AS phone FROM members m JOIN users u ON u.id = m.user_id WHERE m.status = "active"') as $m) {
+                $recipients[] = ['email' => $m['email'], 'phone' => $m['phone'] ?? null, 'member_id' => (int) $m['id'],
+                    'vars' => ['first_name' => $m['first_name'], 'membership_no' => $m['membership_no'], 'subject' => $subject, 'body' => $body]];
+            }
+            break;
+        case 'all':
+        default:
+            foreach (fetch_all('SELECT m.*, u.email, u.phone AS phone FROM members m JOIN users u ON u.id = m.user_id') as $m) {
+                $recipients[] = ['email' => $m['email'], 'phone' => $m['phone'] ?? null, 'member_id' => (int) $m['id'],
+                    'vars' => ['first_name' => $m['first_name'], 'membership_no' => $m['membership_no'], 'subject' => $subject, 'body' => $body]];
+            }
+            break;
+    }
+
+    $sent = 0;
+    foreach ($recipients as $r) {
+        if (in_array('email', $channels, true) && !empty($r['email'])) {
+            send_notification('email', (string) $r['email'], render_template($subject, $r['vars']), render_template($body, $r['vars']),
+                ['member_id' => $r['member_id'] ?? null, 'event' => 'announcement']);
+            $sent++;
+        }
+        if (in_array('sms', $channels, true) && !empty($r['phone'])) {
+            send_notification('sms', (string) $r['phone'], '', render_template($body, $r['vars']),
+                ['member_id' => $r['member_id'] ?? null, 'event' => 'announcement']);
+            $sent++;
+        }
+    }
+    audit('announcement_sent', null, null, $audience . ' via ' . implode('+', $channels) . ' (' . $sent . ' messages)');
+    return ['recipients' => count($recipients), 'messages' => $sent];
+}
+
+/** Re-attempt delivery of a logged or failed notification. */
+function retry_notification(int $id): int
+{
+    $row = fetch_one('SELECT * FROM notifications WHERE id = ?', [$id]);
+    if (!$row) {
+        throw new RuntimeException('Notification not found.');
+    }
+    $result = deliver($row['channel'], $row['recipient'], (string) $row['subject'], $row['body']);
+    q('UPDATE notifications SET status = ?, provider = ?, error = ?, attempts = attempts + 1, sent_at = ? WHERE id = ?', [
+        $result['status'],
+        $result['provider'],
+        $result['error'] !== null ? substr((string) $result['error'], 0, 255) : null,
+        in_array($result['status'], ['sent', 'logged'], true) ? date('Y-m-d H:i:s') : null,
+        $id,
+    ]);
+    return $id;
+}
+
+/** Notification log with filters. */
+function list_notifications(array $filters = []): array
+{
+    $sql = 'SELECT n.*, m.membership_no, m.first_name, m.last_name
+            FROM notifications n
+            LEFT JOIN members m ON m.id = n.member_id
+            WHERE 1 = 1';
+    $params = [];
+    if (!empty($filters['channel'])) {
+        $sql .= ' AND n.channel = ?';
+        $params[] = $filters['channel'];
+    }
+    if (!empty($filters['status'])) {
+        $sql .= ' AND n.status = ?';
+        $params[] = $filters['status'];
+    }
+    if (!empty($filters['event'])) {
+        $sql .= ' AND n.event = ?';
+        $params[] = $filters['event'];
+    }
+    if (!empty($filters['member_id'])) {
+        $sql .= ' AND n.member_id = ?';
+        $params[] = (int) $filters['member_id'];
+    }
+    if (!empty($filters['search'])) {
+        $like = '%' . $filters['search'] . '%';
+        $sql .= ' AND (n.recipient LIKE ? OR n.subject LIKE ? OR n.body LIKE ?)';
+        array_push($params, $like, $like, $like);
+    }
+    $sql .= ' ORDER BY n.id DESC LIMIT 400';
+    return fetch_all($sql, $params);
+}
+
+/** Notification counters for the dashboard. */
+function notification_stats(): array
+{
+    return [
+        'total'  => (int) fetch_value('SELECT COUNT(*) FROM notifications'),
+        'sent'   => (int) fetch_value('SELECT COUNT(*) FROM notifications WHERE status = "sent"'),
+        'logged' => (int) fetch_value('SELECT COUNT(*) FROM notifications WHERE status = "logged"'),
+        'failed' => (int) fetch_value('SELECT COUNT(*) FROM notifications WHERE status = "failed"'),
+        'email'  => (int) fetch_value('SELECT COUNT(*) FROM notifications WHERE channel = "email"'),
+        'sms'    => (int) fetch_value('SELECT COUNT(*) FROM notifications WHERE channel = "sms"'),
+    ];
+}
+
+/** Persist provider settings submitted from the admin form. */
+function save_notification_settings(array $data): void
+{
+    $keys = [
+        'email_enabled', 'email_driver', 'email_from_address', 'email_from_name',
+        'smtp_host', 'smtp_port', 'smtp_username', 'smtp_password', 'smtp_encryption',
+        'sms_enabled', 'sms_driver', 'sms_sender_id', 'sms_api_key',
+        'sms_generic_url', 'sms_url_method', 'sms_termii_url',
+        'sms_twilio_sid', 'sms_twilio_token', 'sms_twilio_from',
+    ];
+    foreach ($keys as $key) {
+        if (!array_key_exists($key, $data)) {
+            continue;
+        }
+        $value = is_bool($data[$key]) ? ($data[$key] ? '1' : '0') : (string) $data[$key];
+        q('INSERT INTO settings (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)',
+            ['notify_' . $key, $value]);
+    }
+    audit('notification_settings', null, null, 'Notification provider settings updated');
+}
+
+/* =====================================================================
+ * Delivery drivers
+ * ===================================================================*/
+
+/** Simple SMTP client (supports STARTTLS/SSL and AUTH LOGIN). */
+function smtp_send(array $email, string $to, string $subject, string $body): void
+{
+    $smtp = $email['smtp'];
+    $host = $smtp['host'];
+    $port = (int) $smtp['port'];
+    $enc = strtolower((string) $smtp['encryption']);
+    if ($host === '') {
+        throw new RuntimeException('SMTP host is not configured.');
+    }
+
+    $transport = $enc === 'ssl' ? 'ssl://' : '';
+    $fp = @stream_socket_client($transport . $host . ':' . $port, $errno, $errstr, 20);
+    if (!$fp) {
+        throw new RuntimeException('SMTP connection failed: ' . $errstr);
+    }
+    stream_set_timeout($fp, 20);
+
+    $read = function () use ($fp): string {
+        $data = '';
+        while (($line = fgets($fp, 515)) !== false) {
+            $data .= $line;
+            if (isset($line[3]) && $line[3] === ' ') {
+                break;
+            }
+        }
+        return $data;
+    };
+    $cmd = function (string $command) use ($fp, $read): string {
+        fwrite($fp, $command . "\r\n");
+        return $read();
+    };
+    $expect = function (string $response, string $code): void {
+        if (strpos($response, (string) $code) !== 0) {
+            throw new RuntimeException('SMTP error: ' . trim($response));
+        }
+    };
+
+    $expect($read(), '220');
+    $hostname = $_SERVER['SERVER_NAME'] ?? 'localhost';
+    $expect($cmd('EHLO ' . $hostname), '250');
+    if ($enc === 'tls') {
+        $expect($cmd('STARTTLS'), '220');
+        if (!stream_socket_enable_crypto($fp, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+            throw new RuntimeException('Unable to start TLS encryption.');
+        }
+        $expect($cmd('EHLO ' . $hostname), '250');
+    }
+    if (!empty($smtp['username'])) {
+        $expect($cmd('AUTH LOGIN'), '334');
+        $expect($cmd(base64_encode($smtp['username'])), '334');
+        $expect($cmd(base64_encode($smtp['password'])), '235');
+    }
+
+    $from = $email['from_address'];
+    $expect($cmd('MAIL FROM:<' . $from . '>'), '250');
+    $expect($cmd('RCPT TO:<' . $to . '>'), '250');
+    $expect($cmd('DATA'), '354');
+
+    $headers = 'From: ' . mime_name($email['from_name']) . ' <' . $from . ">\r\n"
+        . 'To: <' . $to . ">\r\n"
+        . 'Subject: ' . mime_header($subject) . "\r\n"
+        . "MIME-Version: 1.0\r\n"
+        . "Content-Type: text/plain; charset=UTF-8\r\n"
+        . "Content-Transfer-Encoding: 8bit\r\n"
+        . 'Date: ' . date('r') . "\r\n";
+
+    $data = $headers . "\r\n" . str_replace("\n.", "\n..", str_replace("\r\n", "\n", $body)) . "\r\n.";
+    $expect($cmd($data), '250');
+    $cmd('QUIT');
+    fclose($fp);
+}
+
+/** Send email through PHP's mail() function (requires a configured MTA). */
+function mail_send(array $email, string $to, string $subject, string $body): void
+{
+    $from = $email['from_address'];
+    $headers = 'From: ' . mime_name($email['from_name']) . ' <' . $from . ">\r\n"
+        . "MIME-Version: 1.0\r\n"
+        . "Content-Type: text/plain; charset=UTF-8\r\n";
+    $ok = @mail($to, mime_header($subject), $body, $headers);
+    if (!$ok) {
+        throw new RuntimeException('mail() failed. Configure an MTA or use the SMTP driver.');
+    }
+}
+
+/** Generic HTTP SMS gateway (URL template). */
+function sms_generic(array $sms, string $to, string $message): void
+{
+    if (empty($sms['generic_url'])) {
+        throw new RuntimeException('Generic SMS gateway URL is not configured.');
+    }
+    $map = [
+        '{to}' => rawurlencode($to),
+        '{message}' => rawurlencode($message),
+        '{sender}' => rawurlencode((string) $sms['sender_id']),
+        '{api_key}' => rawurlencode((string) $sms['api_key']),
+    ];
+    $url = strtr($sms['generic_url'], $map);
+    $method = $sms['url_method'] === 'POST' ? 'POST' : 'GET';
+    [$status, $response] = http_request($method, $url, null, []);
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException('SMS gateway returned HTTP ' . $status . ' ' . substr($response, 0, 120));
+    }
+}
+
+/** Termii SMS (Nigeria). */
+function sms_termii(array $sms, string $to, string $message): void
+{
+    if (empty($sms['api_key'])) {
+        throw new RuntimeException('Termii API key is not configured.');
+    }
+    $payload = json_encode([
+        'to' => $to,
+        'from' => $sms['sender_id'],
+        'sms' => $message,
+        'type' => 'plain',
+        'channel' => 'generic',
+        'api_key' => $sms['api_key'],
+    ]);
+    [$status, $response] = http_request($sms['termii_url'], $payload, ['Content-Type: application/json']);
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException('Termii returned HTTP ' . $status . ' ' . substr($response, 0, 120));
+    }
+}
+
+/** Twilio SMS. */
+function sms_twilio(array $sms, string $to, string $message): void
+{
+    $tw = $sms['twilio'];
+    if (empty($tw['sid']) || empty($tw['token']) || empty($tw['from'])) {
+        throw new RuntimeException('Twilio credentials are not fully configured.');
+    }
+    $url = 'https://api.twilio.com/2010-04-01/Accounts/' . rawurlencode($tw['sid']) . '/Messages.json';
+    $body = http_build_query(['From' => $tw['from'], 'To' => $to, 'Body' => $message]);
+    [$status, $response] = http_request('POST', $url, $body, [
+        'Content-Type: application/x-www-form-urlencoded',
+        'Authorization: Basic ' . base64_encode($tw['sid'] . ':' . $tw['token']),
+    ]);
+    if ($status < 200 || $status >= 300) {
+        throw new RuntimeException('Twilio returned HTTP ' . $status . ' ' . substr($response, 0, 120));
+    }
+}
+
+/** Minimal HTTP client using cURL, falling back to streams. Returns [status, body]. */
+function http_request(string $method, string $url, ?string $body = null, array $headers = []): array
+{
+    $method = strtoupper($method);
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_HTTPHEADER     => $headers,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
+        if ($body !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        }
+        $response = curl_exec($ch);
+        if ($response === false) {
+            $error = curl_error($ch);
+            curl_close($ch);
+            throw new RuntimeException('HTTP request failed: ' . $error);
+        }
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        return [$status, (string) $response];
+    }
+
+    $options = [
+        'http' => [
+            'method'        => $method,
+            'header'        => implode("\r\n", $headers),
+            'content'       => $body ?? '',
+            'timeout'       => 20,
+            'ignore_errors' => true,
+        ],
+    ];
+    $response = @file_get_contents($url, false, stream_context_create($options));
+    if ($response === false) {
+        throw new RuntimeException('HTTP request failed (streams).');
+    }
+    $status = 0;
+    foreach ($http_response_header ?? [] as $header) {
+        if (preg_match('#^HTTP/\S+\s+(\d{3})#', $header, $m)) {
+            $status = (int) $m[1];
+        }
+    }
+    return [$status, $response];
+}
+
+/** Encode a display name for an email header. */
+function mime_name(string $name): string
+{
+    return preg_match('/[^\x20-\x7e]/', $name) ? '=?UTF-8?B?' . base64_encode($name) . '?=' : $name;
+}
+
+/** Encode a subject line for an email header. */
+function mime_header(string $text): string
+{
+    return preg_match('/[^\x20-\x7e]/', $text) ? '=?UTF-8?B?' . base64_encode($text) . '?=' : $text;
+}
+
+/** Human readable label for a notification status. */
+function notification_status_badge(string $status): string
+{
+    $map = ['sent' => 'success', 'logged' => 'secondary', 'failed' => 'danger'];
+    return '<span class="badge text-bg-' . ($map[$status] ?? 'secondary') . '">' . e(label($status)) . '</span>';
+}
